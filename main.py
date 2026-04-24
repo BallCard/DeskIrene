@@ -3,6 +3,7 @@
 import sys
 import os
 import random
+from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "libs"))
 
@@ -33,10 +34,64 @@ STATE_LIST = list(ANIMATION_STATES.keys())
 STATE_WEIGHTS = [3, 1.5, 1, 1, 1, 1, 1, 1]
 
 
-def make_mask_from_pixmap(pix):
-    """从 QPixmap 的 alpha 通道生成 QBitmap mask（Qt 原生方法）"""
+def _sample_bg_color(img):
+    """采样角落像素，返回平均背景色"""
+    w, h = img.width(), img.height()
+    corners = [(0,0), (1,0), (0,1), (w-1,h-1), (w-2,h-1), (w-1,h-2),
+               (10,0), (0,10), (w//2,0), (0,h//2)]
+    r_sum = g_sum = b_sum = count = 0
+    for x, y in corners:
+        c = img.pixelColor(x, y)
+        r_sum += c.red(); g_sum += c.green(); b_sum += c.blue()
+        count += 1
+    return QColor(r_sum // count, g_sum // count, b_sum // count)
+
+
+def clean_alpha(pix, tolerance=18):
+    """从边缘 flood fill 清除背景，保留角色内部浅色"""
     img = pix.toImage().convertToFormat(QImage.Format_ARGB32)
-    # createAlphaMask 直接从 alpha 通道生成 1bpp 图像
+    w, h = img.width(), img.height()
+    bg = _sample_bg_color(img)
+    transparent = QColor(0, 0, 0, 0)
+
+    # 判断像素是否接近背景色
+    def is_bg(x, y):
+        c = img.pixelColor(x, y)
+        return (abs(c.red() - bg.red()) < tolerance and
+                abs(c.green() - bg.green()) < tolerance and
+                abs(c.blue() - bg.blue()) < tolerance)
+
+    # BFS 从四条边开始，只清除与边缘连通的背景
+    from collections import deque
+    visited = set()
+    queue = deque()
+    for x in range(w):
+        for y in [0, h - 1]:
+            if is_bg(x, y):
+                queue.append((x, y))
+                visited.add((x, y))
+    for y in range(h):
+        for x in [0, w - 1]:
+            if is_bg(x, y) and (x, y) not in visited:
+                queue.append((x, y))
+                visited.add((x, y))
+
+    while queue:
+        cx, cy = queue.popleft()
+        img.setPixelColor(cx, cy, transparent)
+        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
+                visited.add((nx, ny))
+                if is_bg(nx, ny):
+                    queue.append((nx, ny))
+
+    return QPixmap.fromImage(img)
+
+
+def make_mask_from_pixmap(pix):
+    """从 QPixmap 的 alpha 通道生成 QBitmap mask"""
+    img = pix.toImage().convertToFormat(QImage.Format_ARGB32)
     alpha_mask = img.createAlphaMask(Qt.ThresholdDither)
     if alpha_mask.isNull():
         return QBitmap()
@@ -54,6 +109,7 @@ class PetWindow(QWidget):
             Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
 
         # 加载、缩放、生成 mask
         self.current_state = "idle"
@@ -77,7 +133,9 @@ class PetWindow(QWidget):
                 self.display_w, self.display_h,
                 Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
-            self.scaled_sprites[state_name] = scaled
+            # 清除 AI 生图残留的低 alpha 背景像素
+            cleaned = clean_alpha(scaled)
+            self.scaled_sprites[state_name] = cleaned
 
         self.setFixedSize(self.display_w, self.display_h)
         self._drag_pos = None
@@ -118,6 +176,10 @@ class PetWindow(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        # 先用透明色填充整个画布，防止残留
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         pix = self.scaled_sprites.get(self.current_state)
         if not pix or pix.isNull():
             painter.end()
